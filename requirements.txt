@@ -2,5 +2,3 @@ torch
 torchvision
 scikit-learn
 matplotlib
-
-pip install torch torchvision matplotlib scikit-learn

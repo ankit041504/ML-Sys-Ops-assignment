@@ -1,60 +1,124 @@
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.utils.data import DataLoader, DistributedSampler
-from torchvision import datasets, transforms
-from model import SimpleNN
 import time
 
-def setup(rank, world_size):
-    dist.init_process_group(
-        backend="gloo",
-        init_method="tcp://127.0.0.1:12355",
-        rank=rank,
-        world_size=world_size
-    )
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
 
-def cleanup():
-    dist.destroy_process_group()
+from model import SimpleNN
+from utils import flatten_images, calculate_accuracy
 
-def train(rank, world_size):
-    setup(rank, world_size)
 
+def get_dataset():
     transform = transforms.Compose([transforms.ToTensor()])
-    dataset = datasets.MNIST(".", download=True, transform=transform)
+    dataset = datasets.MNIST(
+        root="./data",
+        train=True,
+        download=True,
+        transform=transform
+    )
+    return dataset
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    loader = DataLoader(dataset, batch_size=64, sampler=sampler)
 
-    model = SimpleNN()
-    model = torch.nn.parallel.DistributedDataParallel(model)
+def average_models(models):
+    """
+    Average model weights across workers
+    """
+    avg_model = models[0]
 
-    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    for key in avg_model.state_dict().keys():
+        avg_param = torch.stack(
+            [m.state_dict()[key].float() for m in models], dim=0
+        ).mean(dim=0)
+
+        avg_model.state_dict()[key].copy_(avg_param)
+
+    return avg_model
+
+
+def train_worker(rank, world_size, return_dict):
+
+    device = torch.device("cpu")
+
+    dataset = get_dataset()
+
+    # Split dataset manually across workers
+    data_per_worker = len(dataset) // world_size
+    start = rank * data_per_worker
+    end = start + data_per_worker
+
+    subset = Subset(dataset, range(start, end))
+    loader = DataLoader(subset, batch_size=64, shuffle=True)
+
+    model = SimpleNN().to(device)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    start = time.time()
+    epochs = 3
 
-    for epoch in range(3):
-        sampler.set_epoch(epoch)
-        for x, y in loader:
-            x = x.view(x.size(0), -1)
-            pred = model(x)
-            loss = loss_fn(pred, y)
+    for epoch in range(epochs):
 
-            opt.zero_grad()
+        total_loss = 0
+        total_acc = 0
+        batches = 0
+
+        for images, labels in loader:
+
+            images = flatten_images(images).to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            loss = loss_fn(outputs, labels)
+
+            optimizer.zero_grad()
             loss.backward()
-            opt.step()
+            optimizer.step()
 
-    end = time.time()
+            acc = calculate_accuracy(outputs, labels)
 
-    if rank == 0:
-        print("Distributed Training Time:", end - start)
+            total_loss += loss.item()
+            total_acc += acc
+            batches += 1
 
-    cleanup()
+        print(
+            f"[Worker {rank}] Epoch {epoch+1} | "
+            f"Loss {total_loss/batches:.4f} | "
+            f"Acc {(total_acc/batches)*100:.2f}%"
+        )
+
+    return_dict[rank] = model.state_dict()
+
 
 def main():
+
     world_size = 2
-    mp.spawn(train, args=(world_size,), nprocs=world_size)
+
+    manager = mp.Manager()
+    return_dict = manager.dict()
+
+    print("Running Simulated Distributed Training")
+
+    start_time = time.time()
+
+    processes = []
+
+    for rank in range(world_size):
+        p = mp.Process(
+            target=train_worker,
+            args=(rank, world_size, return_dict)
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    total_time = time.time() - start_time
+
+    print(f"\nSimulated Distributed Training Time: {total_time:.2f} sec")
+
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
